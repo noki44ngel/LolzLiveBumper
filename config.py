@@ -1,0 +1,30 @@
+API_BASE_URL = 'https://api.lolz.live'
+API_TOKEN = 'token'
+
+TELEGRAM_BOT_TOKEN = 'token'
+TELEGRAM_CHAT_ID = 'id'
+
+THREAD_IDS = [
+    9457941,
+    9504347,
+    9348756,
+    9286655,
+    8864532,
+    9444846,
+    9148788,
+    8710532
+]
+
+BUMP_INTERVAL = 43200
+CHECK_INTERVAL = 120
+API_DELAY = 1.0
+
+USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
+RETRY_DELAYS = [60, 300, 900, 3600]
+MAX_CONSECUTIVE_FAILURES = 10
+
+ADMIN_USER_IDS = [id]
+
+DATABASE_PATH = 'bump_data.db'
+LOG_FILE = 'bump.log'
