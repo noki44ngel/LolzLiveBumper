@@ -14,12 +14,13 @@ from aiogram.client.default import DefaultBotProperties
 from config import (
     API_BASE_URL, API_TOKEN, THREAD_IDS,
     BUMP_INTERVAL, CHECK_INTERVAL, API_DELAY,
-    RETRY_DELAYS, MAX_CONSECUTIVE_FAILURES,
+    RETRY_DELAYS, MAX_CONSECUTIVE_FAILURES, TOKEN_ERROR_PAUSE,
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, ADMIN_USER_IDS, USER_AGENT
 )
 from database import Database
 dp = Dispatcher()
 bot = None
+service = None
 if TELEGRAM_BOT_TOKEN and 'YOUR_' not in TELEGRAM_BOT_TOKEN:
     bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 
@@ -32,6 +33,10 @@ class AsyncBumpService:
         }
         self.running = True
         self._session = None
+        self._cycle_lock = asyncio.Lock()
+        self._cycle_running = False
+        self._last_error_notify = 0
+        self._cycle_count = 0
     
     async def get_session(self):
         if self._session is None or self._session.closed:
@@ -49,7 +54,9 @@ class AsyncBumpService:
         try:
             async with session.get(url, timeout=30) as response:
                 if response.status == 200:
-                    return await response.json()
+                    data = await response.json()
+                    logger.debug(f"Thread {thread_id} info: {list(data.keys())}")
+                    return data
                 elif response.status == 429:
                     logger.warning("Rate limit hit")
                 return None
@@ -83,6 +90,14 @@ class AsyncBumpService:
                 if not thread.get('is_active'):
                     self.db.activate_thread(thread_id)
                     logger.info(f"Re-activated thread {thread_id}")
+                if thread.get('title') == 'Unknown':
+                    info = await self._get_thread_info(thread_id)
+                    if info:
+                        title = info.get('thread', {}).get('thread_title', 'Unknown')
+                        if title != 'Unknown':
+                            self.db.upsert_thread(thread_id, title=title)
+                            logger.info(f"Updated title: {title}")
+                        await asyncio.sleep(API_DELAY)
 
         for thread in db_threads:
             tid = thread['thread_id']
@@ -122,9 +137,12 @@ class AsyncBumpService:
                     result['next_time'] = int(time.time()) + 120
                     
                 elif response.status == 401:
-                    logger.critical("INVALID TOKEN")
-                    self.running = False
-                    if bot: await bot.send_message(TELEGRAM_CHAT_ID, "🚨 <b>CRITICAL: Invalid Token!</b>")
+                    logger.critical("INVALID TOKEN - pausing all threads")
+                    result['message'] = 'Token Error'
+                    result['is_token_error'] = True
+                    result['next_time'] = int(time.time()) + TOKEN_ERROR_PAUSE
+                    if bot:
+                        await bot.send_message(TELEGRAM_CHAT_ID, f"<b>Token Error!</b>\nRetry in {TOKEN_ERROR_PAUSE//60}m")
                     return result
 
                 else:
@@ -152,6 +170,12 @@ class AsyncBumpService:
         elif result.get('is_cooldown'):
             logger.warning(f"Cooldown {thread_id}")
             self.db.upsert_thread(thread_id, next_bump_time=result['next_time'], last_error=result['message'], consecutive_failures=0)
+        
+        elif result.get('is_token_error'):
+            logger.warning(f"Token error - pausing all threads for {TOKEN_ERROR_PAUSE//60}m")
+            for t in self.db.get_all_threads():
+                if t.get('is_active'):
+                    self.db.upsert_thread(t['thread_id'], next_bump_time=result['next_time'])
             
         else:
             consecutive_failures += 1
@@ -163,8 +187,10 @@ class AsyncBumpService:
                     last_error=f"Too many errors: {result['message']}", 
                     consecutive_failures=0
                 )
-                if bot:
-                    await bot.send_message(TELEGRAM_CHAT_ID, f"⚠️ <b>Skipped {thread_id}</b> (too many errors)")
+                now = int(time.time())
+                if bot and (now - self._last_error_notify) > 300:
+                    self._last_error_notify = now
+                    await bot.send_message(TELEGRAM_CHAT_ID, f"<b>! Skipped {thread_id}</b> (too many errors)")
             else:
                 delay = RETRY_DELAYS[min(consecutive_failures, len(RETRY_DELAYS)-1)]
                 next_retry = int(time.time()) + delay
@@ -173,21 +199,36 @@ class AsyncBumpService:
                 
         return result
 
-    async def run_cycle(self):
-        ready = self.db.get_threads_ready_for_bump()
-        if not ready: return
+    async def run_cycle(self, force: bool = False):
+        if self._cycle_running and not force:
+            logger.debug("Cycle already running, skipping")
+            return False
         
-        logger.info(f"Ready threads: {len(ready)}")
-        results = []
-        
-        for thread in ready:
-            if not self.running: break
-            res = await self.process_thread(thread)
-            results.append(res)
-            await asyncio.sleep(API_DELAY)
-            
-        if results and bot:
-            await self._notify_summary(results)
+        async with self._cycle_lock:
+            self._cycle_running = True
+            try:
+                self._cycle_count += 1
+                if self._cycle_count % 720 == 0:
+                    self.db.cleanup_old_history(days=30)
+                
+                ready = self.db.get_threads_ready_for_bump()
+                if not ready:
+                    return True
+                
+                logger.info(f"Ready threads: {len(ready)}")
+                results = []
+                
+                for thread in ready:
+                    if not self.running: break
+                    res = await self.process_thread(thread)
+                    results.append(res)
+                    await asyncio.sleep(API_DELAY)
+                    
+                if results and bot:
+                    await self._notify_summary(results)
+                return True
+            finally:
+                self._cycle_running = False
 
     async def _notify_summary(self, results: list):
         bumped = [r for r in results if r['success']]
@@ -201,21 +242,20 @@ class AsyncBumpService:
         
         lines = []
         if bumped:
-            lines.append(f"<b>Success: {len(bumped)}</b>")
+            lines.append(f"<b>Success</b> ({len(bumped)})")
             for item in bumped:
-                title = item.get('title', str(item['thread_id']))[:45]
-                lines.append(f"<code>{title}</code>")
+                thread_id = item.get('thread_id')
+                lines.append(f"     ✔ {thread_id}")
             lines.append("")
             
         if pending:
-            lines.append(f"<b>Pending: {len(pending)}</b>")
+            lines.append(f"<b>Pending</b> ({len(pending)})")
             for item in pending:
-                title = item.get('title', str(item['thread_id']))[:35]
+                thread_id = item.get('thread_id')
                 wait_sec = max(0, item['next_bump_time'] - now)
                 h, m = wait_sec // 3600, (wait_sec % 3600) // 60
-                
-                wait_str = f"{h}h {m}m" if h > 0 else f"{m}m"
-                lines.append(f"<code>{title}</code> - <b>in {wait_str}</b>")
+                wait_str = f"{h}h {m:02d}m" if h > 0 else f"{m}m"
+                lines.append(f"<code>{wait_str:>7}</code> - {thread_id}")
         
         if lines:
             try:
@@ -233,59 +273,119 @@ async def status_handler(message: types.Message):
     active = [t for t in threads if t.get('is_active')]
     now = int(time.time())
     
-    text = f"<b>System Status</b>\nActive: {len(active)}\n\n"
-    for t in active:
-        tid = t['thread_id']
-        wait = max(0, t['next_bump_time'] - now)
-        
-        if wait == 0:
-            status = "READY"
-        else:
-            h, m = wait // 3600, (wait % 3600) // 60
-            status = f"{h}h {m}m"
+    ready = [t for t in active if t['next_bump_time'] <= now]
+    pending = sorted([t for t in active if t['next_bump_time'] > now], key=lambda x: x['next_bump_time'])
+    
+    lines = []
+    
+    if ready:
+        lines.append(f"<b>Ready</b> ({len(ready)})")
+        for t in ready:
+            lines.append(f"     ✔ {t['thread_id']}")
+        lines.append("")
             
-        text += f"ID: <code>{tid}</code>\n➤ <b>{status}</b>\n\n"
+    if pending:
+        lines.append(f"<b>Status</b> ({len(pending)})")
+        for t in pending:
+            wait_sec = max(0, t['next_bump_time'] - now)
+            h, m = wait_sec // 3600, (wait_sec % 3600) // 60
+            wait_str = f"{h}h {m:02d}m" if h > 0 else f"{m}m"
+            lines.append(f"<code>{wait_str:>7}</code> - {t['thread_id']}")
         
-    await message.answer(text)
+    await message.answer("\n".join(lines) or "No threads")
 
 @dp.message(Command("start"))
 async def start_handler(message: types.Message):
     await message.answer("^.^")
 
-async def bump_loop(service):
+@dp.message(Command("test"))
+async def test_handler(message: types.Message):
+    if ADMIN_USER_IDS and message.from_user.id not in ADMIN_USER_IDS:
+        return
+    
+    global service
+    if not service:
+        await message.answer("! Service not ready")
+        return
+    
+    if service._cycle_running:
+        await message.answer("... Cycle already running")
+        return
+    
+    db = Database()
+    now = int(time.time())
+    threads = db.get_all_threads()
+    reset_count = 0
+    
+    for t in threads:
+        if t.get('is_active') and (t.get('consecutive_failures', 0) > 0 or t['next_bump_time'] > now):
+            db.upsert_thread(t['thread_id'], next_bump_time=now, consecutive_failures=0, last_error=None)
+            reset_count += 1
+    
+    await message.answer(f"> Reset {reset_count} threads\n> Running cycle...")
+    
+    try:
+        await service.run_cycle(force=True)
+        await message.answer("✔ Done")
+    except Exception as e:
+        await message.answer(f"✗ {e}")
+
+async def bump_loop(svc, stop_event: asyncio.Event):
     logger.info("Bump loop started")
-    await service.initialize_threads()
+    await svc.initialize_threads()
     
     if bot:
         try:
             await bot.send_message(TELEGRAM_CHAT_ID, "<b>Started</b>")
         except: pass
         
-    while service.running:
+    while svc.running:
         try:
-            await service.run_cycle()
-            await asyncio.sleep(CHECK_INTERVAL)
+            await svc.run_cycle()
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=CHECK_INTERVAL)
+                break
+            except asyncio.TimeoutError:
+                pass
         except asyncio.CancelledError:
             break
         except Exception as e:
             logger.exception(f"Loop error: {e}")
-            await asyncio.sleep(60)
+            await asyncio.sleep(5)
 
 async def main():
+    global service
     service = AsyncBumpService()
     loop = asyncio.get_running_loop()
     stop_event = asyncio.Event()
+    bump_task = None
+    
     def signal_handler():
         logger.info("Shutdown signal received")
         service.running = False
         stop_event.set()
+        if bump_task:
+            bump_task.cancel()
+    
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, signal_handler)
-    bump_task = asyncio.create_task(bump_loop(service))
+    
+    bump_task = asyncio.create_task(bump_loop(service, stop_event))
+    
     try:
         if bot:
             logger.info("Starting polling + bump loop")
-            await asyncio.gather(dp.start_polling(bot), bump_task, return_exceptions=True)
+            polling_task = asyncio.create_task(dp.start_polling(bot))
+            done, pending = await asyncio.wait(
+                [polling_task, bump_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
         else:
             logger.info("Starting bump loop only (No Bot)")
             await bump_task
